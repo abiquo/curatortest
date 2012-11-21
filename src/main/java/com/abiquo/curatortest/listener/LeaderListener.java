@@ -2,24 +2,35 @@ package com.abiquo.curatortest.listener;
 
 import static java.lang.Thread.currentThread;
 
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+
 import javax.servlet.ServletContextEvent;
 import javax.servlet.ServletContextListener;
 
 import org.apache.log4j.Logger;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher.Event.EventType;
 
 import com.netflix.curator.framework.CuratorFramework;
 import com.netflix.curator.framework.CuratorFrameworkFactory;
+import com.netflix.curator.framework.api.CuratorWatcher;
 import com.netflix.curator.framework.recipes.leader.LeaderSelector;
 import com.netflix.curator.framework.recipes.leader.LeaderSelectorListener;
 import com.netflix.curator.framework.state.ConnectionState;
 import com.netflix.curator.retry.RetryNTimes;
 
-public class LeaderListener implements ServletContextListener, LeaderSelectorListener
+public class LeaderListener implements ServletContextListener, LeaderSelectorListener,
+    CuratorWatcher
 {
     protected final static Logger LOGGER = Logger.getLogger(LeaderListener.class);
 
     /** Zk-connection to server/s cluster. */
-    private final static String ZK_SERVER = System.getProperty("zk.serverConnection", "localhost:2181");
+    private final static String ZK_SERVER =
+        System.getProperty("zk.serverConnection", "localhost:2181");
+
+    private final static String ID = System.getProperty("id", "http://localhost/api");
 
     /** Zk-node used on the ''leaderSelector'' to synch participants. */
     private final static String LEADER_PATH = "/consumer-leader";
@@ -44,16 +55,56 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
 
             LOGGER.info("Connected to " + ZK_SERVER);
 
-            leaderSelector = new LeaderSelector(curatorClient, LEADER_PATH, this);
-            leaderSelector.start();
-            // return immediately, will notify if leadership is elected on
-            // LeaderSelectorListener#takeLeadership
+            initializeLeaderSelector();
+
         }
         catch (Exception e)
         {
             LOGGER.error("Won't start. Not connection to zk server at " + ZK_SERVER, e);
             throw new RuntimeException(e);
         }
+    }
+
+    private void initializeLeaderSelector() throws Exception
+    {
+        leaderSelector = new LeaderSelector(curatorClient, LEADER_PATH, this);
+        leaderSelector.setId(ID);
+        leaderSelector.start();
+
+        String znodePath = findLastPath();
+        curatorClient.checkExists().usingWatcher(this).forPath(znodePath);
+    }
+
+    /**
+     * Find the path of the last node created.
+     * 
+     * @throws Exception
+     */
+    private String findLastPath() throws Exception
+    {
+        List<String> child;
+
+        do
+        {
+            child = curatorClient.getChildren().forPath(LEADER_PATH);
+        }
+        while (child == null || child.size() == 0);
+
+        Collections.sort(child, new Comparator<String>()
+        {
+            // names of the znodes are like 'generateduuid'-lock-seq
+            // we need to compare only the seq
+            public int compare(final String o1, final String o2)
+            {
+                Integer seq1 = Integer.valueOf(o1.substring(o1.indexOf("lock-") + 5));
+                Integer seq2 = Integer.valueOf(o2.substring(o2.indexOf("lock-") + 5));
+
+                // we want ordered descending
+                return seq2.compareTo(seq1);
+            }
+        });
+
+        return LEADER_PATH + "/" + child.get(0);
     }
 
     /**
@@ -120,16 +171,28 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
                 }
                 break;
             case RECONNECTED:
-                // theory leaderSelector.requeue(); https://github.com/Netflix/curator/issues/24
-                leaderSelector.close();
-                leaderSelector = new LeaderSelector(curatorClient, LEADER_PATH, this);
-                leaderSelector.start();
+                // do nothing: the #process(WatchedEvent event) method will create the new lead
+                // selector
                 break;
             case CONNECTED:
                 break;
             case LOST:
                 // already disconnected by SUSPENDED state
                 break;
+        }
+    }
+
+    /**
+     * Process the NodeDeleted event.
+     */
+    public void process(final WatchedEvent event) throws Exception
+    {
+        if (event.getType() == EventType.NodeDeleted)
+        {
+            leaderSelector.close();
+
+            // reinitialize the leader selector
+            initializeLeaderSelector();
         }
     }
 }
