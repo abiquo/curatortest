@@ -13,6 +13,7 @@ import org.apache.log4j.Logger;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher.Event.EventType;
 
+import com.netflix.curator.RetryLoop;
 import com.netflix.curator.framework.CuratorFramework;
 import com.netflix.curator.framework.CuratorFrameworkFactory;
 import com.netflix.curator.framework.api.CuratorWatcher;
@@ -27,13 +28,13 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
     protected final static Logger LOGGER = Logger.getLogger(LeaderListener.class);
 
     /** Zk-connection to server/s cluster. */
-    private final static String ZK_SERVER =
-        System.getProperty("zk.serverConnection", "localhost:2181");
+    private final static String ZK_SERVER = System.getProperty("zk.serverConnection",
+        "localhost:2181");
 
-    private final static String ID = System.getProperty("id", "http://localhost/api");
+    private final static String ID = System.getProperty("id", "-Did=unsetted");
 
     /** Zk-node used on the ''leaderSelector'' to synch participants. */
-    private final static String LEADER_PATH = "/consumer-leader";
+    private final static String LEADER_PATH = "/test-leader";
 
     /** Zk-recipe to select one participant in the cluster. @see {@link LeaderSelectorListener}. */
     private LeaderSelector leaderSelector;
@@ -48,15 +49,7 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
     {
         try
         {
-            curatorClient =
-                CuratorFrameworkFactory
-                    .newClient(ZK_SERVER, 15000, 10000, new RetryNTimes(3, 1000));
-            curatorClient.start();
-
-            LOGGER.info("Connected to " + ZK_SERVER);
-
-            initializeLeaderSelector();
-
+            startZookeeper();
         }
         catch (Exception e)
         {
@@ -64,47 +57,30 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
             throw new RuntimeException(e);
         }
     }
-
-    private void initializeLeaderSelector() throws Exception
+    
+    public void contextDestroyed(final ServletContextEvent arg0)
     {
+        if (leaderSelector.hasLeadership())
+        {
+            LOGGER.info("Leader shutdown");
+            consumer.stop();
+        }
+
+        leaderSelector.close();
+    }
+
+    /** Connects to ZK-Server and adds as participant to {@link LeaderSelector} cluster. */
+    protected void startZookeeper() throws Exception
+    {
+        curatorClient =
+            CuratorFrameworkFactory.newClient(ZK_SERVER, 15000, 10000, new RetryNTimes(3, 1000));
+        curatorClient.start();
+
+        LOGGER.info("Connected to " + ZK_SERVER);
+
         leaderSelector = new LeaderSelector(curatorClient, LEADER_PATH, this);
         leaderSelector.setId(ID);
         leaderSelector.start();
-
-        String znodePath = findLastPath();
-        curatorClient.checkExists().usingWatcher(this).forPath(znodePath);
-    }
-
-    /**
-     * Find the path of the last node created.
-     * 
-     * @throws Exception
-     */
-    private String findLastPath() throws Exception
-    {
-        List<String> child;
-
-        do
-        {
-            child = curatorClient.getChildren().forPath(LEADER_PATH);
-        }
-        while (child == null || child.size() == 0);
-
-        Collections.sort(child, new Comparator<String>()
-        {
-            // names of the znodes are like 'generateduuid'-lock-seq
-            // we need to compare only the seq
-            public int compare(final String o1, final String o2)
-            {
-                Integer seq1 = Integer.valueOf(o1.substring(o1.indexOf("lock-") + 5));
-                Integer seq2 = Integer.valueOf(o2.substring(o2.indexOf("lock-") + 5));
-
-                // we want ordered descending
-                return seq2.compareTo(seq1);
-            }
-        });
-
-        return LEADER_PATH + "/" + child.get(0);
     }
 
     /**
@@ -141,16 +117,7 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
         LOGGER.info("Current instance no longer the leader");
     }
 
-    public void contextDestroyed(final ServletContextEvent arg0)
-    {
-        if (leaderSelector.hasLeadership())
-        {
-            LOGGER.info("Leader shutdown");
-            consumer.stop();
-        }
 
-        leaderSelector.close();
-    }
 
     /**
      * If the SUSPENDED state is reported, the instance must assume that it might no longer be the
@@ -159,23 +126,30 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
      */
     public void stateChanged(final CuratorFramework client, final ConnectionState newState)
     {
-        LOGGER.info("state to - " + newState.name());
+        LOGGER.info(String.format("%s - %s", newState.name(), LEADER_PATH));
 
         switch (newState)
         {
             case SUSPENDED:
                 if (leaderSelector.hasLeadership())
                 {
-                    LOGGER.info("Leader suspended, shutdown");
+                    LOGGER.info("Leader suspended. Shutting down consumer");
                     consumer.stop();
                 }
                 break;
             case RECONNECTED:
-                // do nothing: the #process(WatchedEvent event) method will create the new lead
-                // selector
+                // theory leaderSelector.requeue();
+                // https://github.com/Netflix/curator/issues/24
+                // The method #process will create a new leaderSelector instance. Once is
+                // reconnected, watch again
+                LOGGER.info("Processing Zookeeper reconnect");
                 break;
+
             case CONNECTED:
+                LOGGER.info("Processing Zookeeper connect");
+                watchItself();
                 break;
+
             case LOST:
                 // already disconnected by SUSPENDED state
                 break;
@@ -189,10 +163,80 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
     {
         if (event.getType() == EventType.NodeDeleted)
         {
+            LOGGER.info("Processing deletion of Zookeeper path " + event.getPath());
+
+            if (leaderSelector.hasLeadership())
+            {
+                LOGGER.info("Leader deleted. Shutting down consumer");
+                consumer.stop();
+            }
+
             leaderSelector.close();
 
             // reinitialize the leader selector
-            initializeLeaderSelector();
+            leaderSelector = new LeaderSelector(curatorClient, LEADER_PATH, this);
+            leaderSelector.setId(ID);
+            leaderSelector.start();
+
+            LOGGER.info("Starting Leader selector instance");
         }
+    }
+
+    private void watchItself()
+    {
+        // Due the asynchronous nature of zookeeper, the getChildren can raise an
+        // exception because the last znode could not be yet created when we are
+        // looking for it. So the best solution is use the RetryLoop as Curator
+        // recommends.
+        // (Retry Policy is configured at initialization time)
+        RetryLoop rl = curatorClient.getZookeeperClient().newRetryLoop();
+        List<String> child;
+        int i = 0;
+
+        while (rl.shouldContinue())
+        {
+            LOGGER.info("Trying to put a watcher in the last node created. (" + i + " attempts )");
+            try
+            {
+                Thread.sleep(3000);
+
+                child = curatorClient.getChildren().forPath(LEADER_PATH);
+
+                Collections.sort(child, new Comparator<String>()
+                {
+                    // names of the znodes are like 'generateduuid'-lock-seq
+                    // we need to compare only the seq
+                    public int compare(final String o1, final String o2)
+                    {
+
+                        Integer seq1 = Integer.valueOf(o1.substring(o1.indexOf("lock-") + 5));
+                        Integer seq2 = Integer.valueOf(o2.substring(o2.indexOf("lock-") + 5));
+
+                        // we want ordered descending
+                        return seq2.compareTo(seq1);
+
+                    }
+                });
+
+                String path = LEADER_PATH + "/" + child.get(0);
+                LOGGER.info("Starting watcher for path " + path);
+                curatorClient.checkExists().usingWatcher(this).forPath(path);
+
+                rl.markComplete();
+            }
+            catch (Exception e)
+            {
+                try
+                {
+                    LOGGER.warn("Node could not execute the 'watchItself' in Zookeeper");
+                    rl.takeException(e);
+                }
+                catch (Exception e1)
+                {
+                    LOGGER.error("Could not Watch 'itself' node.");
+                }
+            }
+        }
+
     }
 }

@@ -10,12 +10,16 @@ public class Consumer
     /** Start consuming messages in other Thread, do not block, return immediately. */
     public void start()
     {
+        LOGGER.info("*****************");
         LOGGER.info("Consumer started");
+        LOGGER.info("*****************");
     }
 
     /** Stop consuming messages. */
     public void stop()
     {
+        LOGGER.info("*****************");
         LOGGER.info("Consumer stopped");
+        LOGGER.info("*****************");
     }
 }
