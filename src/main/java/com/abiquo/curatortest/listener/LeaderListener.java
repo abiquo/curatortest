@@ -2,6 +2,8 @@ package com.abiquo.curatortest.listener;
 
 import static java.lang.Thread.currentThread;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -31,8 +33,20 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
     private final static String ZK_SERVER = System.getProperty("zk.serverConnection",
         "localhost:2181");
 
-    private final static String ID = System.getProperty("id", "-Did=unsetted");
-
+    private static String getId()
+    {
+        try
+        {
+            String hostname = InetAddress.getLocalHost().toString();
+            String bindport = System.getProperty("jetty.port","8080");
+            return String.format("%s:%s", hostname, bindport); 
+        }
+        catch (UnknownHostException e)
+        {
+            return "hostname not configured";
+        }
+    }
+    
     /** Zk-node used on the ''leaderSelector'' to synch participants. */
     private final static String LEADER_PATH = "/test-leader";
 
@@ -79,7 +93,7 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
         LOGGER.info("Connected to " + ZK_SERVER);
 
         leaderSelector = new LeaderSelector(curatorClient, LEADER_PATH, this);
-        leaderSelector.setId(ID);
+        leaderSelector.setId(getId());
         leaderSelector.start();
     }
 
@@ -175,7 +189,7 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
 
             // reinitialize the leader selector
             leaderSelector = new LeaderSelector(curatorClient, LEADER_PATH, this);
-            leaderSelector.setId(ID);
+            leaderSelector.setId(getId());
             leaderSelector.start();
 
             LOGGER.info("Starting Leader selector instance");
