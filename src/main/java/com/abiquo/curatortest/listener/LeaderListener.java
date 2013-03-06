@@ -38,15 +38,15 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
         try
         {
             String hostname = InetAddress.getLocalHost().toString();
-            String bindport = System.getProperty("jetty.port","8080");
-            return String.format("%s:%s", hostname, bindport); 
+            String bindport = System.getProperty("jetty.port", "8080");
+            return String.format("%s:%s", hostname, bindport);
         }
         catch (UnknownHostException e)
         {
             return "hostname not configured";
         }
     }
-    
+
     /** Zk-node used on the ''leaderSelector'' to synch participants. */
     private final static String LEADER_PATH = "/test-leader";
 
@@ -71,7 +71,7 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
             throw new RuntimeException(e);
         }
     }
-    
+
     public void contextDestroyed(final ServletContextEvent arg0)
     {
         if (leaderSelector.hasLeadership())
@@ -131,8 +131,6 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
         LOGGER.info("Current instance no longer the leader");
     }
 
-
-
     /**
      * If the SUSPENDED state is reported, the instance must assume that it might no longer be the
      * leader until it receives a RECONNECTED state. If the LOST state is reported, the instance is
@@ -157,6 +155,11 @@ public class LeaderListener implements ServletContextListener, LeaderSelectorLis
                 // The method #process will create a new leaderSelector instance. Once is
                 // reconnected, watch again
                 LOGGER.info("Processing Zookeeper reconnect");
+                // reinitialize the leader selector
+                leaderSelector = new LeaderSelector(curatorClient, LEADER_PATH, this);
+                leaderSelector.setId(getId());
+                leaderSelector.start();
+                watchItself();
                 break;
 
             case CONNECTED:
